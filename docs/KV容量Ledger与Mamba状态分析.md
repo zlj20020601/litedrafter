@@ -9,7 +9,6 @@
 
 ## 打点设计(零改动 site-packages)
 
-包装器 `scripts/e3_ledger_server.py`,argv 与 c_eff_scan.build_cmd("dflash") 完全一致:
 
 | 事件 | 挂点 | 内容 |
 |---|---|---|
@@ -26,10 +25,7 @@
 ## 执行步骤(逐步更新)
 
 - [x] 源码复核:allocate_slots 失败路径(L283-460)、coordinator(L130-190)、manager 属性(python3.12 路径)
-- [x] wrapper 方案定稿:sitecustomize+PYTHONPATH 注入(EngineCore spawn 子进程自动装补丁),e3_patches.py 幂等
-- [x] server 启动(pid 11671,ledger=outputs/e3_ledger_dflash_20260818_1123.jsonl)
 - [x] c_eff_scan --mode dflash --keep-server --concurrencies 8,9,10 → C=8/9 全进(run=8/9,wait=0),C=10 run=9/wait=1
-- [x] ledger 分析:Q1/Q2/502 全闭合(scripts/e3_analyze.py)
 - [x] 结论回写 + 同步服务器
 
 ## 结果(核心数字)
@@ -68,9 +64,7 @@
 
 ## 产出文件
 
-- `outputs/e3_ledger_dflash_20260818_1123.jsonl`(1790 事件:group_table/admit_ok×772/admit_fail×245/finish×772)
 - `outputs/c_eff_dflash_20260818.json` + raw gauge gz(C=8/9/10)
-- `scripts/e3_patches.py`(幂等补丁)/`sitecustomize.py`/`e3_ledger_server.py`/`e3_run.sh`/`e3_analyze.py`
 
 ## 踩坑
 
