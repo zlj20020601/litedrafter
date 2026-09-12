@@ -1,11 +1,11 @@
-# E3 执行记录:现场 per-group KV ledger(2026-08-18)
+# KV 容量 Ledger（账本）与 Mamba 状态分析
+
+> 本文量化各类 KV state 的物理占用，重点确认 Mamba/GDN recurrent state 对容量的影响。
 
 > **做了什么:** 在 LIVE dflash server 上以 monkey-patch 包装器(零改动 site-packages)打点 KVCacheManager 准入路径,跑 C=8/9/10 三点,钉死"DFlash 第 10 个请求被哪个组的需块挡住"与稳态 per-group 实际持块,闭合因果链④(38 groups → capacity=9)。
 
 ## 目的(对应 0817 设计验收标准)
 
-- **E3 完成** = 能指着一个 group 说"C=10 的第 10 个请求因该组 free blocks 不足被拒"
-- 同时回答 E1 遗留:离线上界 1294 blocks/请求 vs runtime 反解 ~449,差在哪些组(mamba 实际持 2 还是 16、attn 按当前长度还是满长)
 
 ## 打点设计(零改动 site-packages)
 
@@ -34,12 +34,10 @@
 
 ## 结果(核心数字)
 
-**动态扫描(顺带闭合 E2 的 knee onset 问题):**
 
 | C | max_run | max_wait | kv | 结论 |
 |---|---|---|---|---|
 | 8 | 8 | 0 | 0.866 | 全准入 |
-| 9 | 9 | 0 | 0.975 | 第 9 个可进(E0 缺口补上) |
 | 10 | 9 | 1 | 0.975 | **第 10 个被拒 → queueing knee=10** |
 
 → 正式口径:**active concurrency ceiling=9,queueing knee=10**(0817 术语裁定条件满足)
@@ -61,13 +59,10 @@
 **502/1294 之谜闭合:**
 
 - 实测 426 ↔ runtime 反解 4039/9≈449(差值=启动账目杂项,无未建模机制)
-- E1 离线上界 1294 的高估来源:attn 按 block_size=16 算出 910 blocks,runtime 实为 592 tok/block 只需 42
 - 0817 反解 ~1.05GB/请求 ↔ 实测 426×2.42MB≈0.97GB ✓
 
-## 结论(因果链④闭合 + E1 修正)
 
 1. **④ 闭合:DFlash 容量惩罚的 binding constraint 是 mamba 组碎片化×spec 常数 state**:AR 3 组×8 层合并、每请求 3 blocks;DFlash 24 单层组、每请求 384 blocks(组数×8 × spec slots×16 = 128×),占准入需求 93%。第 10 个请求被 24 个 mamba 组的 384 块常数需求挡住,实锤。
-2. **H2 必须改写**:uniform-page 在 runtime 不是"65KB 页垫到 2.28MB 浪费 36.5×",而是 block_size 膨胀到 592 tokens/块——字节全被利用,attn 侧每请求仅需 42 块,不是瓶颈。E1 的"36.5× 垫页"是 block 口径误读(spec dump 的 block_size 与 runtime 不同源)。
 3. H3(lookahead+1)在 592 粒度下不可见(只在精确边界跳块);H4(mamba 常数主导)为最终主因,且量化为 931MB/请求。
 4. 池账本:3919 块(启动日志 4039 含 null/杂项);ceiling=9 = floor((3919-杂项)/426)。
 
@@ -79,14 +74,10 @@
 
 ## 踩坑
 
-1. **EngineCore 是 spawn 子进程,父进程 monkey-patch 到不了**——VLLM_ENABLE_V1_MULTIPROCESSING=0 在 0.26 api_server 路径不生效;解法=PYTHONPATH+sitecustomize 让子进程 import 时自动装(E3_LEDGER 未设置则不激活,零污染)
-2. e3_run.sh 必须导出 conda env 的 PATH(ninja 编译 mamba kernel;LD_LIBRARY_PATH 踩坑沿用 E1)
 3. pkill -f 会匹配自身 ssh 命令行自杀(exit 255);用 pidfile+精确 pid 杀
 4. 崩溃残留的 EngineCore 孤儿进程占 22GB 显存会让下次启动报"Free memory 不足"——启动前查 nvidia-smi compute-apps
 5. 完整请求 ntok=1268(1024 prompt+256 out−4?以 finish 事件为准),不是预设的 1280
 
 ## 关联
 
-- [[E0_E1_归因执行记录_20260818]](前置:离线 ledger 与未闭合差;H2 结论已被本文修正)
-- [[实验设计_C_eff归因_20260817]](E0-E4 计划;E3 验收标准已达成,E2 的 DF 侧被本次顺带完成)
 

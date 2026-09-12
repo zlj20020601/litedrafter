@@ -1,4 +1,6 @@
-# LiteDrafter 三层容量实验 — Qwen3.5-4B（2026-08-12）
+# Hybrid 模型容量分析
+
+> 本文解释 Hybrid 架构中 Mamba state、KV layout 和并发容量损失之间的关系。
 
 > **做了什么：** 用 CodeContests 256×1024 benchmark 数据（Qwen3.5-4B tokenizer 重新生成），在 vLLM 0.26.0 + env_vllm026 下完成三层容量实验。发现 DFlash 在 hybrid linear/full attention 模型上的容量惩罚主因不是静态显存（与 Qwen3-8B 结论不同），而是 **vLLM KVCacheSpec group 碎片化**：AR 的 4 组退化为 DFlash 的 38 组（每层一组），导致 KV 容量从 249,856 tokens 崩塌至 32,969 tokens（-86.8%）。
 
@@ -213,7 +215,6 @@ AR 手算复现 61.00x（0817 修正版）：Σ组最坏 = FA 256 block × 64KB�
 
 ⚠️ 勘误（0817）：上一版"259 blocks/请求、池≈15,799"是单位混用错误——15,799×17.2MB≈271GB 物理不可能，且"精确复现"实为循环论证（用 61 反推池、再除回 61）。已废弃。
 
-DFlash：38 组全 1 层 → 每请求最坏 = 38 项直接相加；由日志反解 per-request = 4039÷8.05 ≈ **502 blocks ≈ 1.2GB**。但按 AR 同法朴素估算（mamba 48页×2.39MB + FA 8×256×64KB + drafter ≈ 0.28GB ≈ 117 blocks → 4039÷117 ≈ 34.5x）与 8.05 不符，缺口 ~4.3x 未解释——各 spec 的 page_size_padded / block_size / SW 窗口 / spec_blocks 精确值需 startup spec dump（[[实验设计_C_eff归因_20260817]] E1），502 的组成是 ledger 第一目标。
 
 **机制假设（未证明，H1-H4）**：碎片化可能通过 cdiv 取整/页对齐放大（H2）、per-group 运行时预留放大（H1）、SD 专属预留（H3）、mamba 常数 state 主导（H4）抬高每请求开销。0816 实测 C_eff=9 ≈ 源码口径 8.05 目前只是观测——"哪个组先满、经什么机制"待 per-group ledger 钉死；25.75（÷1280）不作为 baseline。
 
