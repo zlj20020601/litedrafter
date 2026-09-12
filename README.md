@@ -78,3 +78,5 @@ python scripts/c_eff_scan.py --mode dflash --num-spec-tokens 15 --spec-schedule 
 ## 后续工作
 
 继续验证 admission patch 在完成、拒绝 token、EOS、preemption 和 K 改变时的 state 提交与释放；之后评估 target/drafter 独立 physical KV layout，再做 Mamba state 压缩和 D-Cut。
+
+详细项目过程与归因复盘见 [docs/项目总结.md](docs/项目总结.md)。
