@@ -1,0 +1,14 @@
+=== System Info (2026-07-31T10:01:56) ===
+OS:            Linux-5.15.0-97-generic-x86_64-with-glibc2.35
+Python:        3.12.13
+PyTorch:       2.11.0+cu130
+CUDA (torch):  13.0
+GPU:           NVIDIA GeForce RTX 4090
+GPU Memory:    24081 MiB total
+Transformers:  5.13.1
+vLLM:          0.23.1rc1.dev1417+gc8db00b16
+bitsandbytes:  0.49.2
+flash_attn:    NOT FOUND (环境限制)
+dflash:        OK
+Model path:    /root/autodl-tmp/models/Qwen3-8B (EXISTS)
+Drafter path:  /root/autodl-tmp/models/Qwen3-8B-DFlash-b16 (EXISTS)

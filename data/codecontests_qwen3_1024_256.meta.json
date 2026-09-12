@@ -1,0 +1,25 @@
+{
+  "dataset": "mlfoundations-dev/code_contests_processed",
+  "task": "English competitive-programming generation",
+  "tokenizer": "/root/autodl-tmp/models/Qwen3-8B",
+  "chat_template": "Qwen3, enable_thinking=False, add_generation_prompt=True",
+  "selection": {
+    "A_1024_1152": 249,
+    "B1_1153_1280": 7,
+    "seed": 42
+  },
+  "target_length": 1024,
+  "num_prompts": 256,
+  "source_distribution": {
+    "2": 139,
+    "6": 100,
+    "5": 11,
+    "1": 3,
+    "3": 3
+  },
+  "truncated_count": 255,
+  "generated_at": "2026-08-10T19:49:17",
+  "output_file": "/root/autodl-tmp/litedrafter/data/codecontests_qwen3_1024_256.jsonl",
+  "assistant_reference_excluded": true,
+  "preprocess_note": "content-level truncation: reduce user content, re-apply chat template, generation prompt preserved; NOT hard-truncating rendered sequence"
+}

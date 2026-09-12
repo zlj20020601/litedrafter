@@ -1,0 +1,33 @@
+{
+  "dataset": "mlfoundations-dev/code_contests_processed",
+  "task": "English competitive-programming generation",
+  "tokenizer": "/root/autodl-tmp/models/Qwen3.5-4B",
+  "tokenizer_vocab_size": 248044,
+  "chat_template": "Qwen3.5, enable_thinking=False, add_generation_prompt=True",
+  "chat_template_suffix": "<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n",
+  "selection": {
+    "A_1024_1152": 249,
+    "B1_1153_1280": 7,
+    "seed": 42
+  },
+  "target_length": 1024,
+  "num_prompts": 256,
+  "source_distribution": {
+    "6": 104,
+    "5": 10,
+    "2": 134,
+    "1": 5,
+    "3": 3
+  },
+  "truncated_count": 254,
+  "raw_length_stats": {
+    "min": 50,
+    "median": 483,
+    "max": 6148
+  },
+  "generated_at": "2026-08-12T09:49:13",
+  "output_file": "/root/autodl-tmp/litedrafter/data/codecontests_qwen35_4b_1024_256.jsonl",
+  "assistant_reference_excluded": true,
+  "preprocess_note": "content-level truncation: reduce user content, re-apply chat template, generation prompt preserved; NOT hard-truncating rendered sequence",
+  "difference_from_qwen3_8b_version": "Qwen3.5 enable_thinking=False adds </think> suffix (+2 tokens); tokenizer is different (vocab 248044 vs 151936)"
+}

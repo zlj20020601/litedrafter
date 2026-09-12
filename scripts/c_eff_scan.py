@@ -1,0 +1,599 @@
+#!/usr/bin/env python3
+"""
+c_eff_scan.py — S1: Effective Concurrency Knee 扫描采集器 (2026-08-16)
+
+协议 (用户确认版):
+  - closed-loop: 恒定 in-flight = C, streaming completions
+  - 每点 N = max(256, 8*C) (--n-override 可覆盖, 仅供 smoke), prompt 按序循环
+  - 前 C 个 completion = settling, 不计入客户端统计
+  - /metrics 0.2s 轮询: running / waiting / waiting_by_reason{capacity,deferred}
+    / kv_cache_usage_perc
+  - num_preemptions: counter, 点首尾取差
+  - server histogram delta (点首尾): queue / prefill / decode time
+    (count / mean / p50 / p95, 分桶线性插值)
+  - 每点 hard timeout: 只标 TIMEOUT, 不用于判定 C_eff
+  - 超时后已完成样本照常统计 (settling 除外), 未完成标记 cancelled
+
+用法:
+  python c_eff_scan.py --mode ar
+  python c_eff_scan.py --mode dflash
+  python c_eff_scan.py --mode ar --concurrencies 4 --n-override 32   # smoke
+
+与 0812 L1 协议差异 (有意为之):
+  1. max_num_seqs 32 -> 128 (解除人为上限)
+  2. streaming + ignore_eos=True: 每请求 KV 预算恒定 1280 tokens,
+     greedy 提前 EOS 会让高并发点 KV 压力变小、knee 漂移
+  3. closed-loop 语义 (0812 是 burst 提交)
+"""
+
+import argparse
+import asyncio
+import gzip
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+# ---------------------------------------------------------------- 常量
+
+TARGET_MODEL = "/root/autodl-tmp/models/Qwen3.5-4B"
+DRAFT_MODEL = "/root/autodl-tmp/models/Qwen3.5-4B-DFlash"
+CONDA_ENV = "/root/autodl-tmp/conda_envs/env_vllm026"
+PYTHON = f"{CONDA_ENV}/bin/python"
+DATA_FILE = "/root/autodl-tmp/litedrafter/data/codecontests_qwen35_4b_1024_256.jsonl"
+OUTPUT_DIR = "/root/autodl-tmp/litedrafter/outputs"
+LOGS_DIR = "/root/autodl-tmp/litedrafter/logs"
+TODAY = datetime.now().strftime("%Y%m%d")
+
+MODEL_NAME = "qwen35-4b"
+INPUT_LEN = 1024
+OUTPUT_LEN = 256
+
+DEFAULT_CONCURRENCIES = [1, 4, 8, 12, 16, 20, 24, 28, 32, 40, 48, 64, 80, 96]
+
+NSPEC = 15  # dflash num_speculative_tokens; __main__ sets from --num-spec-tokens
+TAG = ""    # output filename suffix, avoids same-day overwrite
+SPEC_SCHEDULE = ""  # num_speculative_tokens_per_batch_size JSON; __main__ sets from --spec-schedule
+
+GAUGE_MAP = {
+    "vllm:num_requests_running": "running",
+    "vllm:num_requests_waiting": "waiting",
+    "vllm:kv_cache_usage_perc": "kv_usage",
+}
+PREEMPTION_NAME = "vllm:num_preemptions"
+WBR_NAME = "vllm:num_requests_waiting_by_reason"
+HIST_MAP = {
+    "vllm:request_queue_time_seconds": "queue",
+    "vllm:request_prefill_time_seconds": "prefill",
+    "vllm:request_decode_time_seconds": "decode",
+}
+
+
+def log(msg):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+# ---------------------------------------------------------------- server
+
+def build_cmd(mode, port, max_num_seqs, max_num_batched_tokens=16384):
+    cmd = [PYTHON, "-m", "vllm.entrypoints.openai.api_server",
+           "--model", TARGET_MODEL, "--port", str(port),
+           "--trust-remote-code", "--dtype", "bfloat16",
+           "--max-model-len", "4096",
+           "--gpu-memory-utilization", "0.90",
+           "--max-num-seqs", str(max_num_seqs),
+           "--max-num-batched-tokens", str(max_num_batched_tokens),
+           "--no-enable-prefix-caching",
+           "--tensor-parallel-size", "1",
+           "--served-model-name", MODEL_NAME,
+           "--enforce-eager"]
+    if mode == "dflash":
+        spec = {"method": "dflash", "model": DRAFT_MODEL,
+                "num_speculative_tokens": NSPEC}
+        if SPEC_SCHEDULE:
+            spec["num_speculative_tokens_per_batch_size"] = json.loads(SPEC_SCHEDULE)
+        cmd += ["--speculative-config", json.dumps(spec)]
+    return cmd
+
+
+def start_server(mode, port, max_num_seqs, max_num_batched_tokens=16384):
+    log_file = os.path.join(LOGS_DIR, f"c_eff_{mode}{TAG}_server_{TODAY}.log")
+    cmd = build_cmd(mode, port, max_num_seqs, max_num_batched_tokens)
+    env = os.environ.copy()
+    env["HF_ENDPOINT"] = "https://hf-mirror.com"
+    env["VLLM_LOGGING_LEVEL"] = "INFO"
+    env["VLLM_USE_V2_MODEL_RUNNER"] = "1"
+    env["LD_LIBRARY_PATH"] = f"{CONDA_ENV}/lib:" + env.get("LD_LIBRARY_PATH", "")
+    env["PATH"] = os.path.dirname(PYTHON) + ":" + env.get("PATH", "")
+    with open(log_file, "w") as lf:
+        proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, env=env)
+    return proc, log_file
+
+
+def wait_ready(log_file, timeout=420):
+    """0812 踩坑: ready 判定必须用 any() 不能 all()"""
+    kw_ready = ["Application startup complete", "Uvicorn running",
+                "Starting vLLM server on"]
+    kw_error = ["Traceback", "CUDA out of memory", "ValueError",
+                "AssertionError", "RuntimeError"]
+    start = time.time()
+    while time.time() - start < timeout:
+        time.sleep(3)
+        if not os.path.exists(log_file):
+            continue
+        with open(log_file, errors="replace") as f:
+            content = f.read()
+        if any(k in content for k in kw_error):
+            return content, False
+        if any(k in content for k in kw_ready):
+            time.sleep(3)
+            with open(log_file, errors="replace") as f:
+                return f.read(), True
+        if int(time.time() - start) % 30 == 0:
+            log(f"  ...等待 server 就绪 ({int(time.time()-start)}s)")
+    with open(log_file, errors="replace") as f:
+        return f.read(), False
+
+
+def kill_server(proc):
+    try:
+        proc.terminate()
+        proc.wait(timeout=15)
+    except Exception:
+        pass
+    subprocess.run(["pkill", "-f", "vllm.entrypoints"], timeout=10,
+                   capture_output=True)
+    time.sleep(3)
+
+
+# ---------------------------------------------------------------- metrics
+
+async def fetch_metrics_text(session, url):
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as r:
+        return await r.text()
+
+
+def parse_prometheus(text):
+    """解析关心的 gauges + histograms。返回 (gauges, wbr, hists)"""
+    gauges, wbr, hists = {}, {}, {}
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        parts = line.rsplit(" ", 1)
+        if len(parts) != 2:
+            continue
+        lhs, val_str = parts
+        try:
+            val = float(val_str)
+        except ValueError:
+            continue
+        if "{" in lhs:
+            name, labels = lhs.split("{", 1)
+            labels = labels.rstrip("}")
+        else:
+            name, labels = lhs, ""
+        if name in GAUGE_MAP:
+            gauges[GAUGE_MAP[name]] = val
+        elif name == PREEMPTION_NAME:
+            gauges["preemptions"] = val
+        elif name == WBR_NAME:
+            m = re.search(r'reason="([^"]+)"', labels)
+            wbr[m.group(1) if m else "unknown"] = val
+        elif name.endswith("_bucket"):
+            base = name[:-len("_bucket")]
+            if base in HIST_MAP:
+                key = HIST_MAP[base]
+                m = re.search(r'le="([^"]+)"', labels)
+                le = float(m.group(1)) if m else float("inf")
+                hists.setdefault(key, {"buckets": [], "sum": 0.0, "count": 0})
+                hists[key]["buckets"].append((le, val))
+        elif name.endswith("_sum"):
+            base = name[:-len("_sum")]
+            if base in HIST_MAP:
+                hists.setdefault(HIST_MAP[base], {"buckets": [], "sum": 0.0, "count": 0})
+                hists[HIST_MAP[base]]["sum"] = val
+        elif name.endswith("_count"):
+            base = name[:-len("_count")]
+            if base in HIST_MAP:
+                hists.setdefault(HIST_MAP[base], {"buckets": [], "sum": 0.0, "count": 0})
+                hists[HIST_MAP[base]]["count"] = val
+    for h in hists.values():
+        h["buckets"].sort(key=lambda x: x[0])
+    return gauges, wbr, hists
+
+
+def hist_percentile(buckets, q):
+    """Prometheus histogram 分桶线性插值分位数。buckets 含 +Inf 行则剔除。"""
+    finite = [(le, c) for le, c in buckets if le != float("inf")]
+    if not finite or finite[-1][1] <= 0:
+        return None
+    total = finite[-1][1]
+    target = total * q
+    prev_le, prev_c = 0.0, 0
+    for le, c in finite:
+        if c >= target:
+            if c == prev_c:
+                return le
+            frac = (target - prev_c) / (c - prev_c)
+            return prev_le + frac * (le - prev_le)
+        prev_le, prev_c = le, c
+    return finite[-1][0]
+
+
+def hist_delta_stats(before, after, key):
+    """点首尾 histogram counter 差 -> {count, mean, p50, p95}"""
+    b = (before or {}).get(key, {"buckets": [], "sum": 0.0, "count": 0})
+    a = (after or {}).get(key, {"buckets": [], "sum": 0.0, "count": 0})
+    dcount = a["count"] - b["count"]
+    dsum = a["sum"] - b["sum"]
+    dbuckets = []
+    for (le_a, c_a), (le_b, c_b) in zip(a["buckets"], b["buckets"]):
+        dbuckets.append((le_a, c_a - c_b))
+    if dcount <= 0:
+        return {"count": max(0, int(dcount)), "mean": None, "p50": None, "p95": None}
+    return {
+        "count": int(dcount),
+        "mean": dsum / dcount,
+        "p50": hist_percentile(dbuckets, 0.50),
+        "p95": hist_percentile(dbuckets, 0.95),
+    }
+
+
+async def poll_loop(session, metrics_url, interval, stop_evt, samples):
+    """常驻 gauge 采样器, 样本带 monotonic 时间戳"""
+    while not stop_evt.is_set():
+        t = time.monotonic()
+        try:
+            text = await fetch_metrics_text(session, metrics_url)
+            gauges, wbr, _ = parse_prometheus(text)
+            samples.append((t, gauges, wbr))
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(stop_evt.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
+
+
+# ---------------------------------------------------------------- load gen
+
+async def stream_one(session, url, prompt, ignore_eos, req_id):
+    """单条流式请求。返回 per-request 观测 dict。
+    CancelledError 不在此处吞掉, 由 worker 层记录后退出。"""
+    body = {
+        "model": MODEL_NAME,
+        "prompt": prompt,
+        "max_tokens": OUTPUT_LEN,
+        "temperature": 0.0,
+        "seed": 42,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    if ignore_eos:
+        body["ignore_eos"] = True
+    t_send = time.monotonic()
+    ttft = None
+    n_chunks = 0
+    t_first = t_last = None
+    usage_tokens = None
+    async with session.post(url, json=body) as resp:
+        if resp.status != 200:
+            err = (await resp.text())[:200]
+            return {"id": req_id, "ok": False, "error": f"HTTP {resp.status}: {err}"}
+        async for raw in resp.content:
+            line = raw.strip()
+            if not line.startswith(b"data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == b"[DONE]":
+                break
+            try:
+                obj = json.loads(payload)
+            except ValueError:
+                continue
+            if obj.get("usage"):
+                usage_tokens = obj["usage"].get("completion_tokens")
+            choices = obj.get("choices") or []
+            if choices:
+                piece = choices[0].get("text", "")
+                if piece:
+                    now = time.monotonic()
+                    if ttft is None:
+                        ttft = now - t_send
+                        t_first = now
+                    t_last = now
+                    n_chunks += 1
+    t_end = time.monotonic()
+    n_out = usage_tokens if usage_tokens is not None else n_chunks
+    tpot = None
+    if n_out and n_out > 1 and t_last is not None and t_first is not None:
+        tpot = (t_last - t_first) / (n_out - 1)
+    return {
+        "id": req_id, "ok": True,
+        "ttft": ttft, "e2e": t_end - t_send, "tpot": tpot,
+        "n_out": n_out,
+    }
+
+
+async def run_point(session, metrics_url, C, prompts, args, samples):
+    """closed-loop 单并发点。返回该点统计 dict。"""
+    N = args.n_override if args.n_override else max(256, 8 * C)
+    queue = asyncio.Queue()
+    for i in range(N):
+        queue.put_nowait((i, prompts[i % len(prompts)]))
+    url = f"http://127.0.0.1:{args.port}/v1/completions"
+
+    # histogram baseline + preemption baseline
+    text = await fetch_metrics_text(session, metrics_url)
+    g0, _, h0 = parse_prometheus(text)
+    preempt0 = g0.get("preemptions", 0.0)
+
+    results = []
+    completion_order = [0]  # 全局完成序号, <=C 为 settling
+
+    async def worker():
+        while True:
+            try:
+                req_id, prompt = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                r = await stream_one(session, url, prompt, args.ignore_eos, req_id)
+            except asyncio.CancelledError:
+                results.append({"id": req_id, "ok": False,
+                                "error": "cancelled", "cancelled": True})
+                return
+            r["completion_order"] = completion_order[0]
+            completion_order[0] += 1
+            results.append(r)
+
+    t_start = time.monotonic()
+    wall_start = datetime.now().isoformat(timespec="seconds")
+    workers = [asyncio.create_task(worker()) for _ in range(C)]
+    done, pending = await asyncio.wait(workers, timeout=args.point_timeout)
+    timed_out = bool(pending)
+    if timed_out:
+        for w in pending:
+            w.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+    t_end = time.monotonic()
+
+    # histogram final + preemption final
+    text = await fetch_metrics_text(session, metrics_url)
+    g1, _, h1 = parse_prometheus(text)
+    preempt1 = g1.get("preemptions", 0.0)
+
+    # gauge 切片聚合
+    sl = [(t, g, w) for (t, g, w) in samples if t_start <= t <= t_end]
+    def gmax(key):
+        vals = [g[key] for _, g, _ in sl if key in g]
+        return max(vals) if vals else None
+    wbr_cap = [w.get("capacity", 0.0) for _, _, w in sl]
+    wbr_def = [w.get("deferred", 0.0) for _, _, w in sl]
+
+    # 客户端统计 (settling 除外)
+    ok = [r for r in results if r.get("ok") and r["completion_order"] >= C]
+    n_cancelled = sum(1 for r in results if r.get("cancelled"))
+    n_error = sum(1 for r in results if not r.get("ok") and not r.get("cancelled"))
+
+    def pct(vals, q):
+        if not vals:
+            return None
+        s = sorted(vals)
+        if len(s) == 1:
+            return s[0]
+        idx = q * (len(s) - 1)
+        lo, hi = int(idx), min(int(idx) + 1, len(s) - 1)
+        frac = idx - lo
+        return s[lo] * (1 - frac) + s[hi] * frac
+
+    out_tok_total = sum(r["n_out"] or 0 for r in ok)
+    duration = t_end - t_start
+    point = {
+        "C": C,
+        "n_total": N,
+        "n_settling": C,
+        "n_completed": len(ok),
+        "n_cancelled": n_cancelled,
+        "n_error": n_error,
+        "timeout": timed_out,
+        "wall_start": wall_start,
+        "duration_s": round(duration, 2),
+        "client": {
+            "ttft_p50_s": pct([r["ttft"] for r in ok if r["ttft"] is not None], 0.50),
+            "ttft_p95_s": pct([r["ttft"] for r in ok if r["ttft"] is not None], 0.95),
+            "e2e_p50_s": pct([r["e2e"] for r in ok if r.get("e2e") is not None], 0.50),
+            "e2e_p95_s": pct([r["e2e"] for r in ok if r.get("e2e") is not None], 0.95),
+            "tpot_p50_s": pct([r["tpot"] for r in ok if r.get("tpot") is not None], 0.50),
+            "tpot_p95_s": pct([r["tpot"] for r in ok if r.get("tpot") is not None], 0.95),
+            "out_tokens_total": out_tok_total,
+            "output_throughput_tok_s": round(out_tok_total / duration, 2) if duration > 0 else None,
+            "request_throughput_req_s": round(len(ok) / duration, 4) if duration > 0 else None,
+        },
+        "server": {
+            "max_running": gmax("running"),
+            "max_waiting": gmax("waiting"),
+            "max_waiting_by_reason": {
+                "capacity": max(wbr_cap) if wbr_cap else None,
+                "deferred": max(wbr_def) if wbr_def else None,
+            },
+            "max_kv_usage": gmax("kv_usage"),
+            "preemptions_delta": int(preempt1 - preempt0),
+            "hist_delta": {
+                "queue": hist_delta_stats(h0, h1, "queue"),
+                "prefill": hist_delta_stats(h0, h1, "prefill"),
+                "decode": hist_delta_stats(h0, h1, "decode"),
+            },
+        },
+        "note": "server-side histogram 含 settling 请求 (server 无法区分); 客户端统计已排除",
+    }
+    return point
+
+
+# ---------------------------------------------------------------- main
+
+async def amain(args):
+    global aiohttp
+    import aiohttp
+
+    prompts = []
+    with open(DATA_FILE) as f:
+        for line in f:
+            prompts.append(json.loads(line)["messages"][0]["content"])
+    log(f"loaded {len(prompts)} prompts from {os.path.basename(DATA_FILE)}")
+
+    proc = None
+    if not args.keep_server:
+        log(f"starting {args.mode} server (max_num_seqs={args.max_num_seqs}) ...")
+        proc, log_file = start_server(args.mode, args.port, args.max_num_seqs,
+                                      args.max_num_batched_tokens)
+        _, ready = wait_ready(log_file)
+        if not ready:
+            log("FATAL: server 启动失败, 查 log: " + log_file)
+            kill_server(proc)
+            sys.exit(1)
+        log("server ready")
+    else:
+        log("keep-server 模式: 假设 server 已在运行")
+
+    base = f"http://127.0.0.1:{args.port}"
+    # 重度排队下 TTFT 可达分钟级: 只留 connect 超时, 读超时交给 point_timeout 统一裁决
+    timeout = aiohttp.ClientTimeout(total=None, sock_read=None, connect=30)
+    conn = aiohttp.TCPConnector(limit=max(256, args.max_num_seqs * 2))
+    async with aiohttp.ClientSession(timeout=timeout, connector=conn) as session:
+        # 点外 engine warmup (不计入任何统计)
+        for i in range(4):
+            r = await stream_one(session, base + "/v1/completions",
+                                 prompts[i], args.ignore_eos, -1)
+            if not r.get("ok"):
+                log(f"FATAL: warmup 请求失败: {r.get('error')}")
+                if proc:
+                    kill_server(proc)
+                sys.exit(1)
+        log("engine warmup done (4 req, 点外, 不计入统计)")
+
+        # /metrics 可用性自检
+        # vllm:num_preemptions 是 counter, 首次 preemption 发生前 family 不出现
+        # (loggers.py:1191 仅在 num_preempted_reqs>0 时 inc) — 缺席合法, 视为 0
+        text = await fetch_metrics_text(session, base + "/metrics")
+        g_check, wbr_check, h_check = parse_prometheus(text)
+        missing = [k for k in ("running", "waiting", "kv_usage")
+                   if k not in g_check]
+        if missing:
+            log(f"FATAL: /metrics 缺少关键 gauge: {missing}")
+            if proc:
+                kill_server(proc)
+            sys.exit(1)
+        preempt_note = ("absent (0 so far, will appear after first preemption)"
+                        if "preemptions" not in g_check else "present")
+        log(f"/metrics ok: gauges={g_check} wbr_reasons={list(wbr_check.keys())} "
+            f"hists={list(h_check.keys())} preemptions={preempt_note}")
+
+        samples = []
+        stop_evt = asyncio.Event()
+        poller = asyncio.create_task(
+            poll_loop(session, base + "/metrics", args.poll_interval, stop_evt, samples))
+
+        out_path = os.path.join(OUTPUT_DIR, f"c_eff_{args.mode}{args.tag}_{TODAY}.json")
+        result = {
+            "meta": {
+                "protocol": "closed-loop, streaming, settle=first C completions, "
+                            "N=max(256,8C), timeout marks only",
+                "mode": args.mode,
+                "model_target": TARGET_MODEL,
+                "model_draft": DRAFT_MODEL if args.mode == "dflash" else None,
+                "num_speculative_tokens": args.num_spec_tokens if args.mode == "dflash" else 0,
+                "num_speculative_tokens_per_batch_size": (json.loads(args.spec_schedule) if getattr(args, "spec_schedule", "") else None),
+                "max_num_seqs": args.max_num_seqs,
+                "max_model_len": 4096,
+                "max_num_batched_tokens": args.max_num_batched_tokens,
+                "gpu_memory_utilization": 0.90,
+                "prefix_caching": False, "enforce_eager": True,
+                "input_len": INPUT_LEN, "output_len": OUTPUT_LEN,
+                "ignore_eos": args.ignore_eos,
+                "temperature": 0.0, "seed": 42,
+                "point_timeout_s": args.point_timeout,
+                "poll_interval_s": args.poll_interval,
+                "n_override": args.n_override,
+                "data": DATA_FILE,
+                "started": datetime.now().isoformat(timespec="seconds"),
+            },
+            "points": [],
+        }
+        with open(out_path, "w") as f:
+            json.dump(result, f, indent=2, ensure_ascii=False)
+
+        try:
+            for C in args.concurrencies:
+                log(f"=== C={C}  N={args.n_override or max(256, 8*C)} ===")
+                point = await run_point(session, base + "/metrics", C,
+                                        prompts, args, samples)
+                result["points"].append(point)
+                with open(out_path, "w") as f:
+                    json.dump(result, f, indent=2, ensure_ascii=False)
+                s, c = point["server"], point["client"]
+                kv_str = f"{s['max_kv_usage']:.3f}" if s["max_kv_usage"] is not None else "NA"
+                log(f"C={C}: {point['duration_s']}s done={point['n_completed']} "
+                    f"cancel={point['n_cancelled']} timeout={point['timeout']} | "
+                    f"max_run={s['max_running']} max_wait={s['max_waiting']} "
+                    f"kv={kv_str} preempt={s['preemptions_delta']} | "
+                    f"ttft_p95={c['ttft_p95_s']} out={c['output_throughput_tok_s']} tok/s")
+        finally:
+            stop_evt.set()
+            await poller
+            # raw poll 序列落盘 (gzip)
+            raw_path = os.path.join(OUTPUT_DIR, f"c_eff_{args.mode}{args.tag}_raw_{TODAY}.json.gz")
+            with gzip.open(raw_path, "wt") as f:
+                json.dump([{"t": t, "g": g, "wbr": w} for t, g, w in samples], f)
+            log(f"raw poll samples -> {os.path.basename(raw_path)}")
+
+    if proc and not args.keep_server:
+        kill_server(proc)
+    log(f"DONE -> {out_path}")
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--mode", choices=["ar", "dflash"], required=True)
+    p.add_argument("--concurrencies", default=",".join(map(str, DEFAULT_CONCURRENCIES)),
+                   help="逗号分隔, 默认全 14 点")
+    p.add_argument("--port", type=int, default=8301)
+    p.add_argument("--max-num-seqs", type=int, default=128)
+    p.add_argument("--max-num-batched-tokens", type=int, default=16384,
+                   help="per-step token budget (chunked prefill gate; default 16384)")
+    p.add_argument("--point-timeout", type=int, default=1800)
+    p.add_argument("--poll-interval", type=float, default=0.2)
+    p.add_argument("--n-override", type=int, default=0,
+                   help="覆盖每点请求数 (仅供 smoke test, 正式跑必须为 0)")
+    p.add_argument("--no-ignore-eos", dest="ignore_eos", action="store_false",
+                   help="与 0812 完全一致模式 (默认 ignore_eos=True 固定 KV 预算)")
+    p.add_argument("--keep-server", action="store_true",
+                   help="复用已启动的 server, 不启动也不杀")
+    p.add_argument("--num-spec-tokens", type=int, default=15,
+                   help="dflash num_speculative_tokens (default 15; task-1 uses 7/3)")
+    p.add_argument("--spec-schedule", default="",
+                   help="num_speculative_tokens_per_batch_size JSON, e.g. '[[1,4,15],[5,64,3]]' (empty=off)")
+    p.add_argument("--target-model", default="",
+                   help="override TARGET_MODEL path (default Qwen3.5-4B)")
+    p.add_argument("--draft-model", default="",
+                   help="override DRAFT_MODEL path (default Qwen3.5-4B-DFlash)")
+    p.add_argument("--tag", default="",
+                   help="output filename suffix (e.g. _nspec7), avoids same-day overwrite")
+    args = p.parse_args()
+    args.concurrencies = [int(x) for x in args.concurrencies.split(",") if x.strip()]
+    return args
+
+
+if __name__ == "__main__":
+    _args = parse_args()
+    NSPEC = _args.num_spec_tokens
+    TAG = _args.tag
+    SPEC_SCHEDULE = _args.spec_schedule
+    if _args.target_model:
+        TARGET_MODEL = _args.target_model
+    if _args.draft_model:
+        DRAFT_MODEL = _args.draft_model
+    asyncio.run(amain(_args))

@@ -1,0 +1,36 @@
+# Runtime and generated artifacts
+logs/
+outputs/
+backups/
+backups_*/
+__pycache__/
+*.pyc
+*.egg-info/
+.ipynb_checkpoints/
+*.pid
+
+# Local environment and secrets
+.env
+.env.*
+*.pem
+*.key
+*secret*
+*token*
+
+# Model weights and caches
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+huggingface/
+models/
+
+# Large/raw local datasets
+*.jsonl
+*.jsonl.gz
+*.parquet
+
+# Editors
+.vscode/
+.idea/
