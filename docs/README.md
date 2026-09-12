@@ -1,5 +1,14 @@
-# Documentation
+# 文档导航
 
-This directory contains public project notes: attribution, KV ledger methodology, dynamic-K diagnosis, admission patch design, and reproducibility notes.
+这些文档按“问题—实验—归因—修复—结果”的顺序组织，建议先阅读 `项目总结.md`。
 
-Raw logs and generated experiment outputs remain outside the source release.
+| 文档 | 说明 |
+|---|---|
+| `项目总结.md` | 面向面试官的完整项目主线、问题、尝试、patch 和结果 |
+| `归因过程与实验记录.md` | 从环境冻结到容量归因的实验过程 |
+| `KV状态账本与容量测量.md` | per-group KV/Mamba state 的物理账本和测量方法 |
+| `三层容量实验与Hybrid分析.md` | 静态显存、源码机制和运行时并发三层证据 |
+| `容量归因实验设计.md` | workload、指标和对照实验设计 |
+| `并发容量拐点扫描.md` | 不同并发和 n_spec 下的容量拐点 |
+
+文档中的历史日期用于标识实验时间；内部实验编号不作为项目主线。原始日志和完整 JSON 结果不放入公开文档导航。
